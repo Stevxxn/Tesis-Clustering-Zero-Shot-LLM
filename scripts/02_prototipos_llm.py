@@ -1,9 +1,8 @@
 """
 02_prototipos_llm.py
-Módulo 2: Generación de prototipos semánticos Zero-Shot comparando dos familias
-de LLMs distintas:
-  - Modelo 1: Qwen (qwen/qwen3.8-27b vía Groq)
-  - Modelo 2: Mistral (mistral-small-latest vía Mistral AI)
+Módulo 2: Generación de prototipos semánticos Zero-Shot comparando:
+    - Modelo 1 (Nube):  Qwen (qwen/qwen3.8-27b vía Groq)
+    - Modelo 2 (Local): Gemma (gemma3:4b vía Ollama en localhost)
 """
 import os
 import re
@@ -11,23 +10,26 @@ import json
 import time
 import numpy as np
 import torch
-from dotenv import load_dotenv
 from groq import Groq
-from mistralai import Mistral
+from openai import OpenAI
+from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 
-# Cargar variables desde el archivo .env (nunca pegar llaves reales aquí)
+# ==============================================================================
+# CONFIGURACIÓN DE MODELOS Y CONEXIONES
+# ==============================================================================
 load_dotenv()
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
-
 MODELO_QWEN = "qwen/qwen3.8-27b"
-MODELO_MISTRAL = "mistral-small-latest"
+
+# Configuración para Ollama Local (Cero costo, sin límites de cuota)
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL")
+MODELO_GEMMA = "gemma3:4b"
 
 CARPETA_BASE = "datos_tesis"
-NUM_DOCS_MUESTRA_LLM = 45
-MAX_CHARS_POR_DOC = 220
+NUM_DOCS_MUESTRA_LLM = 60
+MAX_CHARS_POR_DOC = 300
 SEMILLA = 42
 
 DATASETS_NOMBRES = [
@@ -69,15 +71,25 @@ Sample documents:
     return prompt
 
 def parsear_prototipos(texto_resp, k):
-    """Extrae y valida exactamente k descripciones desde la respuesta JSON."""
-    match = re.search(r"\{.*\}", texto_resp, re.DOTALL)
-    contenido = json.loads(match.group(0) if match else texto_resp)
-    prototipos = contenido.get("prototypes", [])
-    
-    descripciones = [p["description"] for p in prototipos][:k]
+    """Extrae y valida exactamente k descripciones, incluso si el JSON se truncó al final."""
+    prototipos = []
+    try:
+        match = re.search(r"\{.*\}", texto_resp, re.DOTALL)
+        contenido = json.loads(match.group(0) if match else texto_resp)
+        prototipos = contenido.get("prototypes", [])
+    except Exception:
+        # Rescate elemento por elemento si el JSON quedó incompleto por límite de longitud
+        objetos = re.findall(r'\{[^{}]*"description"\s*:\s*"[^"]*"[^{}]*\}', texto_resp, re.DOTALL)
+        for obj_str in objetos:
+            try:
+                prototipos.append(json.loads(obj_str))
+            except Exception:
+                continue
+
+    descripciones = [p["description"] for p in prototipos if "description" in p][:k]
     while len(descripciones) < k:
         descripciones.append(f"General topic cluster {len(descripciones)}")
-        
+
     return descripciones, prototipos
 
 def consultar_qwen_groq(client_groq, prompt, k, max_reintentos=3):
@@ -106,41 +118,51 @@ def consultar_qwen_groq(client_groq, prompt, k, max_reintentos=3):
             print(f"    [!] Qwen intento {intento} falló ({e}). Reintentando en {espera}s...")
             time.sleep(espera)
 
-def consultar_mistral(client_mistral, prompt, k, max_reintentos=3):
-    """Consulta a Mistral AI forzando salida JSON estructurada."""
+def consultar_gemma_local(client_ollama, prompt, k, max_reintentos=3):
+    """Consulta a Gemma en Ollama usando el endpoint /v1/chat/completions con formato JSON nativo."""
     for intento in range(1, max_reintentos + 1):
         try:
             t0 = time.perf_counter()
-            respuesta = client_mistral.chat.complete(
-                model=MODELO_MISTRAL,
+            respuesta = client_ollama.chat.completions.create(
+                model=MODELO_GEMMA,
                 messages=[
                     {"role": "system", "content": "You output only valid JSON objects."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.0,
-                max_tokens=2048,
-                response_format={"type": "json_object"}
+                temperature=0.2,
+                frequency_penalty=0.3,
+                max_tokens=2000,
+                extra_body={
+                    "format": "json",
+                    "options": {"num_ctx": 8192}
+                }
             )
             duracion = time.perf_counter() - t0
             texto_resp = respuesta.choices[0].message.content or ""
+            
+            if not texto_resp.strip():
+                raise ValueError("Respuesta vacía de Ollama")
+                
             descripciones, prototipos = parsear_prototipos(texto_resp, k)
             return descripciones, prototipos, duracion
         except Exception as e:
             if intento == max_reintentos:
                 raise e
-            espera = 3 * intento
-            print(f"    [!] Mistral intento {intento} falló ({e}). Reintentando en {espera}s...")
-            time.sleep(espera)
+            print(f"    [!] Gemma intento {intento} falló ({e}). Reintentando...")
+            time.sleep(2)
 
 def main():
     t_global_inicio = time.perf_counter()
-    print("--- MÓDULO 2: PROTOTIPOS ZERO-SHOT (QWEN vs MISTRAL) ---")
+    print("--- MÓDULO 2: PROTOTIPOS ZERO-SHOT (QWEN NUBE vs GEMMA LOCAL) ---")
 
     carpeta_prototipos = os.path.join(CARPETA_BASE, "prototipos")
     os.makedirs(carpeta_prototipos, exist_ok=True)
 
     client_groq = Groq(api_key=GROQ_API_KEY)
-    client_mistral = Mistral(api_key=MISTRAL_API_KEY)
+    client_ollama = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
+
+    print(f"[*] Modelo 1 (Nube - Groq):    {MODELO_QWEN}")
+    print(f"[*] Modelo 2 (Local - Ollama): {MODELO_GEMMA}")
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"[*] Cargando Sentence-BERT ('all-MiniLM-L6-v2') en {device.upper()}...")
@@ -191,24 +213,24 @@ def main():
             except Exception as e:
                 print(f"[X] Error en QWEN para {nombre_ds}: {e}")
 
-        # --- 2. MISTRAL ---
-        out_mistral_npy = os.path.join(carpeta_prototipos, f"prototipos_mistral_{nombre_ds}.npy")
-        out_mistral_json = os.path.join(carpeta_prototipos, f"prototipos_mistral_{nombre_ds}.json")
+        # --- 2. GEMMA (OLLAMA LOCAL) ---
+        out_gemma_npy = os.path.join(carpeta_prototipos, f"prototipos_gemma_{nombre_ds}.npy")
+        out_gemma_json = os.path.join(carpeta_prototipos, f"prototipos_gemma_{nombre_ds}.json")
 
-        if os.path.exists(out_mistral_npy) and os.path.exists(out_mistral_json):
-            print("[➔] Prototipos MISTRAL YA EXISTEN. Omitiendo...")
+        if os.path.exists(out_gemma_npy) and os.path.exists(out_gemma_json):
+            print("[➔] Prototipos GEMMA YA EXISTEN. Omitiendo...")
         else:
             try:
-                print(f"[*] Consultando MISTRAL ({MODELO_MISTRAL})...")
-                desc_mistral, raw_mistral, t_mistral = consultar_mistral(client_mistral, prompt, k)
-                emb_mistral = modelo_sbert.encode(desc_mistral, convert_to_numpy=True)
+                print(f"[*] Consultando GEMMA LOCAL ({MODELO_GEMMA})...")
+                desc_gemma, raw_gemma, t_gemma = consultar_gemma_local(client_ollama, prompt, k)
+                emb_gemma = modelo_sbert.encode(desc_gemma, convert_to_numpy=True)
                 
-                np.save(out_mistral_npy, emb_mistral)
-                with open(out_mistral_json, "w", encoding="utf-8") as f:
-                    json.dump(raw_mistral, f, indent=2, ensure_ascii=False)
-                print(f"[✓] MISTRAL listo en {t_mistral:.2f} s | Matriz: {emb_mistral.shape}")
+                np.save(out_gemma_npy, emb_gemma)
+                with open(out_gemma_json, "w", encoding="utf-8") as f:
+                    json.dump(raw_gemma, f, indent=2, ensure_ascii=False)
+                print(f"[✓] GEMMA listo en {t_gemma:.2f} s | Matriz: {emb_gemma.shape}")
             except Exception as e:
-                print(f"[X] Error en MISTRAL para {nombre_ds}: {e}")
+                print(f"[X] Error en GEMMA para {nombre_ds}: {e}")
 
     t_global = time.perf_counter() - t_global_inicio
     print("\n==========================================")

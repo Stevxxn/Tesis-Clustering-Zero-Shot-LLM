@@ -9,6 +9,7 @@ def pipeline():
     scripts = [
         "scripts/01_generar_embeddings_muestra.py",
         "scripts/02_prototipos_llm.py",
+        "scripts/03_correr_experimentos.py",
     ]
     for script in scripts:
         ejecutar_script(script)
